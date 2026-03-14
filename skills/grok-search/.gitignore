@@ -1,0 +1,4 @@
+GrokSearch_new/
+.env
+.venv/
+*__pycache__*

@@ -1,0 +1,10 @@
+*/.venv/
+*Cache/
+*node_modules/
+*.env
+*.log
+*/node_modules/
+*/tmp/
+skills/dev-browser/profiles/
+*/dist/
+*/build/
