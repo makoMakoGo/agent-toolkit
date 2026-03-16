@@ -3,6 +3,7 @@
 
 import argparse
 import asyncio
+import ipaddress
 import json
 import os
 import re
@@ -12,6 +13,7 @@ from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urlsplit, urlunsplit
 
 try:
     import httpx
@@ -128,7 +130,8 @@ class Config:
 
     @property
     def tavily_api_url(self) -> str:
-        return os.getenv("TAVILY_API_URL", "https://api.tavily.com")
+        raw = os.getenv("TAVILY_API_URL", "https://api.tavily.com")
+        return _normalize_tavily_base_url(raw) or "https://api.tavily.com"
 
     @property
     def tavily_api_key(self) -> Optional[str]:
@@ -270,6 +273,244 @@ class _WaitWithRetryAfter(wait_base):
             return max(0.0, delay)
         except (TypeError, ValueError):
             return None
+
+
+# ============================================================================
+# URL 规范化
+# ============================================================================
+
+_URL_WRAPPERS: tuple[tuple[str, str], ...] = (("<", ">"), ("(", ")"), ("[", "]"), ("{", "}"), ('"', '"'), ("'", "'"))
+_TRAILING_URL_PUNCT = ".,;:!?\u3002\uff0c\uff1b\uff1a\uff01\uff1f"
+
+
+def _strip_url_wrappers(text: str) -> str:
+    s = (text or "").strip()
+    changed = True
+    while changed and s:
+        changed = False
+        for left, right in _URL_WRAPPERS:
+            if s.startswith(left) and s.endswith(right) and len(s) >= 2:
+                s = s[1:-1].strip()
+                changed = True
+    return s
+
+
+def _strip_trailing_url_punct(text: str) -> str:
+    s = (text or "").strip()
+    while s and s[-1] in _TRAILING_URL_PUNCT:
+        s = s[:-1].rstrip()
+    return s
+
+
+def _extract_host_from_authority(authority: str) -> str:
+    s = (authority or "").strip()
+    if not s:
+        return ""
+    # Drop userinfo if any: user:pass@host
+    if "@" in s:
+        s = s.rsplit("@", 1)[-1]
+    if s.startswith("[") and "]" in s:
+        return s[1:s.index("]")].strip()
+    # Common invalid-but-seen form: IPv6:port without brackets, e.g. ::1:8080
+    split = _split_unbracketed_ipv6_hostport(s)
+    if split is not None:
+        host, _port = split
+        return host.strip()
+    # IPv6 without brackets (rare); try parse directly first.
+    try:
+        ipaddress.ip_address(s.split("%", 1)[0])
+        return s.split("%", 1)[0]
+    except ValueError:
+        pass
+    host, _, _port = s.partition(":")
+    return host.strip()
+
+
+def _is_local_host(host: str) -> bool:
+    h = (host or "").strip().lower()
+    if not h:
+        return False
+    if h in ("localhost",):
+        return True
+    if h.endswith(".localhost"):
+        return True
+
+    candidate = h.split("%", 1)[0]
+    try:
+        ip = ipaddress.ip_address(candidate)
+    except ValueError:
+        return False
+    return bool(ip.is_loopback or ip.is_private or ip.is_link_local or ip.is_unspecified)
+
+
+def _split_authority_and_remainder(raw: str) -> tuple[str, str]:
+    s = (raw or "").lstrip()
+    if s.startswith("//"):
+        s = s[2:]
+
+    min_index = None
+    for sep in ("/", "?", "#"):
+        idx = s.find(sep)
+        if idx != -1 and (min_index is None or idx < min_index):
+            min_index = idx
+
+    if min_index is None:
+        return s, ""
+    return s[:min_index], s[min_index:]
+
+
+def _is_ipv6_literal(host: str) -> bool:
+    candidate = (host or "").strip()
+    if not candidate:
+        return False
+    candidate = candidate.split("%", 1)[0]
+    try:
+        return ipaddress.ip_address(candidate).version == 6
+    except ValueError:
+        return False
+
+
+def _split_unbracketed_ipv6_hostport(hostport: str) -> Optional[tuple[str, str]]:
+    s = (hostport or "").strip()
+    if not s or s.startswith("["):
+        return None
+    head, sep, tail = s.rpartition(":")
+    if not sep or not tail.isdigit() or not head or ":" not in head:
+        return None
+    try:
+        port = int(tail)
+    except ValueError:
+        return None
+    if not (0 <= port <= 65535):
+        return None
+    candidate = head.split("%", 1)[0]
+    try:
+        return (head, tail) if ipaddress.ip_address(candidate).version == 6 else None
+    except ValueError:
+        return None
+
+
+def _bracket_ipv6_authority(authority: str) -> str:
+    s = (authority or "").strip()
+    if not s:
+        return s
+
+    userinfo, at, hostport = s.rpartition("@")
+    prefix = f"{userinfo}@" if at else ""
+    target = hostport if at else s
+    if target.startswith("["):
+        return s
+
+    split = _split_unbracketed_ipv6_hostport(target)
+    if split is not None:
+        host, port = split
+        return f"{prefix}[{host}]:{port}"
+
+    if not _is_ipv6_literal(target):
+        return s
+
+    return f"{prefix}[{target}]"
+
+
+def normalize_url(url: str) -> str:
+    s = (url or "").strip()
+    while True:
+        unwrapped = _strip_url_wrappers(s)
+        if unwrapped != s:
+            s = unwrapped
+            continue
+        if s and any(s.startswith(left) for left, _ in _URL_WRAPPERS):
+            stripped = _strip_trailing_url_punct(s)
+            if stripped != s:
+                s = stripped
+                continue
+        break
+    if not s:
+        raise ValueError("URL 为空")
+    if re.search(r"\s", s):
+        raise ValueError(f"URL 不应包含空白字符: {url!r}")
+
+    scheme_match = re.match(r"^([a-zA-Z][a-zA-Z0-9+.-]*)://", s)
+    if scheme_match:
+        scheme = scheme_match.group(1).lower()
+        if scheme not in ("http", "https"):
+            raise ValueError(f"仅支持 http/https URL: {s}")
+        parts = urlsplit(s)
+        if parts.netloc:
+            fixed_netloc = _bracket_ipv6_authority(parts.netloc)
+            if fixed_netloc != parts.netloc:
+                return urlunsplit((parts.scheme, fixed_netloc, parts.path, parts.query, parts.fragment))
+        # Fix common invalid form like: http://::1 (IPv6 without brackets)
+        if not parts.netloc and parts.path and ":" in parts.path and not parts.path.startswith("/"):
+            rest = s[len(scheme_match.group(0)) :]
+            authority, remainder = _split_authority_and_remainder(rest)
+            if authority:
+                fixed_authority = _bracket_ipv6_authority(authority)
+                if fixed_authority != authority:
+                    return f"{scheme}://{fixed_authority}{remainder}"
+        return s
+
+    # Protocol-relative URL.
+    if s.startswith("//"):
+        authority, remainder = _split_authority_and_remainder(s)
+        if not authority:
+            raise ValueError(f"URL 缺少主机名: {url!r}")
+        host = _extract_host_from_authority(authority)
+        if not host:
+            raise ValueError(f"URL 缺少主机名: {url!r}")
+        scheme = "http" if _is_local_host(host) else "https"
+        authority = _bracket_ipv6_authority(authority)
+        return f"{scheme}://{authority}{remainder}"
+
+    authority, remainder = _split_authority_and_remainder(s)
+    if not authority:
+        raise ValueError(f"URL 缺少主机名: {url!r}")
+    host = _extract_host_from_authority(authority)
+    if not host:
+        raise ValueError(f"URL 缺少主机名: {url!r}")
+    scheme = "http" if _is_local_host(host) else "https"
+    authority = _bracket_ipv6_authority(authority)
+    return f"{scheme}://{authority}{remainder}"
+
+
+def _materialize_docsify_markdown_url(url: str) -> Optional[str]:
+    parts = urlsplit(url)
+    fragment = (parts.fragment or "").strip()
+    if not fragment.startswith("/"):
+        return None
+
+    route, _, _route_query = fragment[1:].partition("?")
+    route = route.strip()
+    while route.startswith("./"):
+        route = route[2:].lstrip("/")
+    if not route:
+        return None
+    if route.startswith("../") or "/../" in route:
+        return None
+
+    base_path = parts.path or "/"
+    if not base_path.endswith("/"):
+        base_path = base_path.rsplit("/", 1)[0] + "/"
+    path = f"{base_path}{route}"
+    if not path.lower().endswith((".md", ".markdown")):
+        path = f"{path}.md"
+    return urlunsplit((parts.scheme, parts.netloc, path, "", ""))
+
+
+def _normalize_tavily_base_url(raw: str) -> str:
+    value = (raw or "").strip()
+    if not value:
+        return value
+    parts = urlsplit(value)
+    path = parts.path or ""
+    path = path.rstrip("/")
+    lowered = path.lower()
+    for suffix in ("/search", "/extract", "/map", "/crawl", "/research"):
+        if lowered.endswith(suffix):
+            path = path[: -len(suffix)]
+            break
+    base = urlunsplit((parts.scheme, parts.netloc, path, "", ""))
+    return base.rstrip("/")
 
 
 # ============================================================================
@@ -478,10 +719,50 @@ async def _call_tavily_extract(url: str) -> tuple[Optional[str], Optional[str]]:
     except Exception as e:
         return None, f"Tavily extract 错误: {str(e)}"
 
-    results = (data or {}).get("results") or []
-    if isinstance(results, list) and results:
-        content = (results[0] or {}).get("raw_content") or ""
-        if isinstance(content, str) and content.strip():
+    def _first_non_empty_str(*values) -> str:
+        for value in values:
+            if isinstance(value, str) and value.strip():
+                return value
+        return ""
+
+    results = None
+    if isinstance(data, dict):
+        err = _first_non_empty_str(data.get("error"), data.get("message"))
+        if err:
+            return None, f"Tavily extract 错误: {err}"
+        top_level_content = _first_non_empty_str(
+            data.get("raw_content"),
+            data.get("content"),
+            data.get("markdown"),
+            data.get("text"),
+        )
+        if top_level_content:
+            return top_level_content, None
+        results = data.get("results")
+        if results is None:
+            results = data.get("result") or data.get("data")
+    elif isinstance(data, list):
+        results = data
+
+    if isinstance(results, dict):
+        results_list = [results]
+    elif isinstance(results, list):
+        results_list = results
+    else:
+        results_list = []
+
+    if results_list:
+        first = results_list[0]
+        if isinstance(first, dict):
+            content = _first_non_empty_str(
+                first.get("raw_content"),
+                first.get("content"),
+                first.get("markdown"),
+                first.get("text"),
+            )
+        else:
+            content = _first_non_empty_str(first)
+        if content:
             return content, None
         return None, "Tavily extract 返回空内容"
     return None, "Tavily extract 未返回结果"
@@ -678,12 +959,26 @@ async def cmd_web_search(args):
 
 
 async def cmd_web_fetch(args):
+    try:
+        url = normalize_url(args.url)
+    except ValueError as e:
+        print(f"错误: {e}", file=sys.stderr)
+        sys.exit(1)
+
     has_tavily, tavily_reason = _get_tavily_status()
+    docsify_markdown_url = _materialize_docsify_markdown_url(url)
 
     result = None
     tavily_error = None
     if has_tavily:
-        result, tavily_error = await _call_tavily_extract(args.url)
+        result, tavily_error = await _call_tavily_extract(url)
+        if not result and docsify_markdown_url and docsify_markdown_url != url:
+            result2, tavily_error2 = await _call_tavily_extract(docsify_markdown_url)
+            if result2:
+                result = result2
+                tavily_error = None
+            else:
+                tavily_error = tavily_error2 or tavily_error
 
     use_grok_fallback = bool(args.fallback_grok) or (not has_tavily)
     if not has_tavily and tavily_reason:
@@ -693,7 +988,7 @@ async def cmd_web_fetch(args):
     if not result and use_grok_fallback:
         try:
             provider = GrokSearchProvider(config.grok_api_url, config.grok_api_key, config.grok_model)
-            result = await provider.fetch(args.url)
+            result = await provider.fetch(docsify_markdown_url or url)
         except ValueError as e:
             print(f"错误: {e}", file=sys.stderr)
             sys.exit(1)
@@ -702,7 +997,10 @@ async def cmd_web_fetch(args):
             sys.exit(1)
 
     if not result and tavily_error and not use_grok_fallback:
-        print(f"错误: {tavily_error}", file=sys.stderr)
+        if docsify_markdown_url:
+            print(f"错误: {tavily_error}（检测到 hash 路由，可尝试: {docsify_markdown_url} 或加 --fallback-grok）", file=sys.stderr)
+        else:
+            print(f"错误: {tavily_error}", file=sys.stderr)
         sys.exit(1)
     if not result or not str(result).strip():
         print("错误: 获取内容失败", file=sys.stderr)
@@ -716,8 +1014,14 @@ async def cmd_web_fetch(args):
 
 
 async def cmd_web_map(args):
+    try:
+        url = normalize_url(args.url)
+    except ValueError as e:
+        print(json.dumps({"error": str(e)}, ensure_ascii=False), file=sys.stderr)
+        sys.exit(1)
+
     result = await _call_tavily_map(
-        args.url,
+        url,
         args.instructions,
         args.max_depth,
         args.max_breadth,

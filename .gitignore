@@ -6,5 +6,6 @@
 */node_modules/
 */tmp/
 skills/dev-browser/profiles/
+skills/dev-browser/tmp/
 */dist/
 */build/
