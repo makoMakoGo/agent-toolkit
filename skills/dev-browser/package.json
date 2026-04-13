@@ -6,8 +6,8 @@
     "@/*": "./src/*"
   },
   "scripts": {
-    "start-server": "npx tsx scripts/start-server.ts",
-    "start-extension": "npx tsx scripts/start-relay.ts",
+    "start-server": "npx tsx scripts/start.ts standalone",
+    "start-extension": "npx tsx scripts/start.ts extension",
     "dev": "npx tsx --watch src/index.ts",
     "test": "vitest run",
     "test:watch": "vitest"

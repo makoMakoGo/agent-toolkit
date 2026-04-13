@@ -2,6 +2,7 @@
 
 export interface ServeOptions {
   port?: number;
+  host?: string;
   headless?: boolean;
   cdpPort?: number;
   /** Directory to store persistent browser profiles (cookies, localStorage, etc.) */

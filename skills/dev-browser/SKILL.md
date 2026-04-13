@@ -15,64 +15,80 @@ Browser automation that maintains page state across script executions. Write sma
 
 ## Setup
 
-Two modes available. Ask the user if unclear which to use.
-
-### Resolving SKILL_DIR
-
-Prepend this to every Bash snippet (each starts a fresh shell). All examples below use `### SKILL_DIR ###` as a placeholder for this block:
-
-```bash
-SKILL_DIR=$(bash skills/dev-browser/resolve-skill-dir.sh 2>/dev/null) || { echo "Skill not found: dev-browser" >&2; exit 1; }
-```
+Two supported startup modes are available on **Linux** and **native Windows**. Run the following commands from the installed `dev-browser` skill directory. Bash, Git Bash, and WSL are not required.
 
 ### Standalone Mode (Default)
 
 Launches a new Chromium browser for fresh automation sessions.
 
-```bash
-### SKILL_DIR ###
-bash "$SKILL_DIR/server.sh" &
+```text
+npx tsx scripts/start.ts standalone
 ```
 
-Add `--headless` flag if user requests it. **Wait for the `Ready` message before running scripts.**
+Add `--headless` if needed:
+
+```text
+npx tsx scripts/start.ts standalone --headless
+```
+
+Wait for the stable readiness line `Ready` before running scripts.
 
 ### Extension Mode
 
-Connects to user's existing Chrome browser. Use this when:
+Connects to the user's existing Chrome browser. Use this when:
 
 - The user is already logged into sites and wants you to do things behind an authed experience that isn't local dev.
-- The user asks you to use the extension
+- The user asks you to use the extension.
 
-**Important**: The core flow is still the same. You create named pages inside of their browser.
+Start the relay server with:
 
-**Start the relay server:**
-
-```bash
-### SKILL_DIR ###
-(cd "$SKILL_DIR" && npm i && npm run start-extension) &
+```text
+npx tsx scripts/start.ts extension
 ```
 
-Wait for `Waiting for extension to connect...` followed by `Extension connected` in the console. To know that a client has connected and the browser is ready to be controlled.
-**Workflow:**
-
-1. Scripts call `client.page("name")` just like the normal mode to create new pages / connect to existing ones.
-2. Automation runs on the user's actual browser session
+Wait for `Waiting for extension to connect...`. Once the browser extension attaches, the relay logs `Extension connected`.
 
 If the extension hasn't connected yet, tell the user to launch and activate it. Download link: https://github.com/SawyerHood/dev-browser/releases
 
+## Support Matrix
+
+| Mode | Linux | Native Windows | Readiness signal | Notes |
+|------|-------|----------------|------------------|-------|
+| standalone mode | Supported | Supported | `Ready` | Launches a managed Chromium profile under `profiles/` |
+| extension mode | Supported | Supported | `Waiting for extension to connect...` then `Extension connected` | Requires the external browser extension to attach |
+
+## Verification Checklist
+
+- Start `standalone mode` with `npx tsx scripts/start.ts standalone`
+- Observe the readiness line `Ready`
+- Connect with `connect()` and create a named page
+- Start `extension mode` with `npx tsx scripts/start.ts extension`
+- Observe `Waiting for extension to connect...`
+- Attach the browser extension and confirm `Extension connected`
+
+## Known Differences
+
+- `standalone mode` launches and owns its own Chromium profile under this skill directory.
+- `extension mode` depends on the external browser extension and the user's existing Chrome session.
+- In `extension mode`, relay readiness means the server is waiting for the extension; it does not imply browser control is available until `Extension connected` appears.
+- `standalone mode` is the default path for deterministic local automation; `extension mode` is for working inside an already-authenticated browser.
+
+## Non-goal Environments
+
+- `WSL` and `Git Bash` are not part of the supported Windows path for this skill.
+- Native Windows support means PowerShell / Command Prompt can use the documented entrypoints directly.
+- If a user runs inside WSL or Git Bash, treat that as a separate environment rather than the official Windows support contract.
+
 ## Writing Scripts
 
-> **Each standalone Bash snippet resolves `SKILL_DIR` inside the same snippet before changing directories.** The `@/` import alias requires the skill root's config.
+Use small TypeScript files under `tmp/` instead of shell heredocs. Run them from the same `dev-browser` skill directory so the `@/` import alias resolves correctly.
 
-Execute scripts inline using heredocs:
+Example script (`tmp/example.ts`):
 
-```bash
-### SKILL_DIR ###
-(cd "$SKILL_DIR" && npx tsx <<'EOF'
+```typescript
 import { connect, waitForPageLoad } from "@/client.js";
 
 const client = await connect();
-// Create page with custom viewport size (optional)
 const page = await client.page("example", { viewport: { width: 1920, height: 1080 } });
 
 await page.goto("https://example.com");
@@ -80,8 +96,12 @@ await waitForPageLoad(page);
 
 console.log({ title: await page.title(), url: page.url() });
 await client.disconnect();
-EOF
-)
+```
+
+Run it with:
+
+```text
+npx tsx tmp/example.ts
 ```
 
 **Write to `tmp/` files only when** the script needs reuse, is complex, or user explicitly requests it.
@@ -202,11 +222,9 @@ await element.click();
 
 ## Error Recovery
 
-Page state persists after failures. Re-resolve `SKILL_DIR` (see top of file) before debugging:
+Page state persists after failures. To inspect the current state, save a short script such as `tmp/debug.ts` and run it from the `dev-browser` skill directory:
 
-```bash
-### SKILL_DIR ###
-(cd "$SKILL_DIR" && npx tsx <<'EOF'
+```typescript
 import { connect } from "@/client.js";
 
 const client = await connect();
@@ -220,6 +238,10 @@ console.log({
 });
 
 await client.disconnect();
-EOF
-)
+```
+
+Run it with:
+
+```text
+npx tsx tmp/debug.ts
 ```
