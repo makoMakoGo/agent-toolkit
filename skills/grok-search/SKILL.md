@@ -92,7 +92,7 @@ python "<SKILL_DIR>/scripts/groksearch_entry.py" toggle_builtin_tools --action o
 ### Phase 3: Result Synthesis
 1. Cross-reference multiple sources
 2. **Must annotate source and date** for time-sensitive info
-3. **Must include source URLs**: `Title [<sup>1</sup>](URL)`
+3. **Must include source URLs**: `Title [1](URL)`
 
 ## Error Handling
 
@@ -108,7 +108,7 @@ python "<SKILL_DIR>/scripts/groksearch_entry.py" toggle_builtin_tools --action o
 
 | Prohibited | Correct |
 |------------|---------|
-| No source citation | Include `Source [<sup>1</sup>](URL)` |
+| No source citation | Include `Source [1](URL)` |
 | Assume current repo has `skills/grok-search` | Check global skill directories under `$HOME` first, then project-level `.claude/.codex/.agents`, then call `<SKILL_DIR>/scripts/groksearch_entry.py` |
 | Call `scripts/groksearch_cli.py` directly | Call `python scripts/groksearch_entry.py ...` |
 | Use built-in WebSearch/WebFetch | Use GrokSearch CLI |
